@@ -15,11 +15,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from typing import List, Tuple, Optional
 
-# Configuration
-BUILD_DIR = "/home/ubuntu/anjiang/PTX_dataset/cutlass_ptx/build"
-SOURCE_DIR = "/home/ubuntu/anjiang/PTX_dataset/cutlass_ptx"
-INPUT_DIR = f"{BUILD_DIR}/tools/library/generated/gemm"
-OUTPUT_DIR = f"{BUILD_DIR}/tools/library/generated_ptx/gemm"
+# Configuration - use relative paths
+SCRIPT_DIR = Path(__file__).parent.absolute()
+BUILD_DIR = SCRIPT_DIR
+SOURCE_DIR = SCRIPT_DIR.parent
+INPUT_DIR = BUILD_DIR / "tools/library/generated/gemm"
 NVCC = "/usr/local/cuda/bin/nvcc"
 
 # Compilation flags from the original build
@@ -52,12 +52,14 @@ INCLUDE_PATHS = [
     "-isystem", "/usr/local/cuda/include"
 ]
 
-def generate_ptx_single(cu_file: str, job_id: int = 0, verbose: bool = True) -> Tuple[bool, str, str]:
+def generate_ptx_single(cu_file: str, sm_arch: str, output_dir: Path, job_id: int = 0, verbose: bool = True) -> Tuple[bool, str, str]:
     """
     Generate PTX file for a single .cu file
     
     Args:
         cu_file: Path to the .cu file
+        sm_arch: SM architecture (80, 90, 100)
+        output_dir: Output directory for PTX files
         job_id: Job identifier for logging
         verbose: Whether to print progress messages
         
@@ -79,14 +81,15 @@ def generate_ptx_single(cu_file: str, job_id: int = 0, verbose: bool = True) -> 
                 relative_path = cu_path.name
         
         # Create output file path
-        output_file = Path(OUTPUT_DIR) / relative_path.replace('.cu', '.ptx')
+        output_file = output_dir / relative_path.replace('.cu', '.ptx')
         output_file.parent.mkdir(parents=True, exist_ok=True)
         
         if verbose:
-            print(f"[{job_id:4d}] Processing: {relative_path}")
+            print(f"[{job_id:4d}] Processing (sm_{sm_arch}): {relative_path}")
         
-        # Build nvcc command
-        cmd = [NVCC, "-ptx", str(cu_file)] + CUDA_FLAGS + INCLUDE_PATHS + ["-o", str(output_file)]
+        # Build nvcc command with architecture-specific flags
+        cuda_flags = get_cuda_flags_for_arch(sm_arch)
+        cmd = [NVCC, "-ptx", str(cu_file)] + cuda_flags + INCLUDE_PATHS + ["-o", str(output_file)]
         
         # Run compilation
         result = subprocess.run(
@@ -98,12 +101,12 @@ def generate_ptx_single(cu_file: str, job_id: int = 0, verbose: bool = True) -> 
         
         if result.returncode == 0:
             if verbose:
-                print(f"[{job_id:4d}] ✓ Success: {output_file.name}")
+                print(f"[{job_id:4d}] ✓ Success (sm_{sm_arch}): {output_file.name}")
             return True, relative_path, ""
         else:
             error_msg = result.stderr.strip()
             if verbose:
-                print(f"[{job_id:4d}] ✗ Failed: {relative_path}")
+                print(f"[{job_id:4d}] ✗ Failed (sm_{sm_arch}): {relative_path}")
                 if error_msg:
                     print(f"[{job_id:4d}]   Error: {error_msg[:100]}...")
             return False, relative_path, error_msg
@@ -126,7 +129,7 @@ def find_cu_files(directory: str) -> List[str]:
                 cu_files.append(os.path.join(root, file))
     return sorted(cu_files)
 
-def process_directory_serial(directory: str, arch: str, verbose: bool = True) -> Tuple[int, int]:
+def process_directory_serial(directory: str, arch: str, output_dir: Path, verbose: bool = True) -> Tuple[int, int]:
     """Process files in a directory serially"""
     print(f"Processing SM{arch} kernels in {directory}...")
     
@@ -143,7 +146,7 @@ def process_directory_serial(directory: str, arch: str, verbose: bool = True) ->
     failed_files = []
     
     for i, cu_file in enumerate(cu_files, 1):
-        success, relative_path, error = generate_ptx_single(cu_file, i, verbose)
+        success, relative_path, error = generate_ptx_single(cu_file, arch, output_dir, i, verbose)
         if success:
             success_count += 1
         else:
@@ -165,7 +168,7 @@ def process_directory_serial(directory: str, arch: str, verbose: bool = True) ->
     
     return success_count, failed_count
 
-def process_directory_parallel(directory: str, arch: str, max_workers: int = None, verbose: bool = True) -> Tuple[int, int]:
+def process_directory_parallel(directory: str, arch: str, output_dir: Path, max_workers: int = None, verbose: bool = True) -> Tuple[int, int]:
     """Process files in a directory in parallel"""
     if max_workers is None:
         max_workers = multiprocessing.cpu_count()
@@ -190,7 +193,7 @@ def process_directory_parallel(directory: str, arch: str, max_workers: int = Non
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all jobs
         future_to_file = {
-            executor.submit(generate_ptx_single, cu_file, i, False): (cu_file, i) 
+            executor.submit(generate_ptx_single, cu_file, arch, output_dir, i, False): (cu_file, i) 
             for i, cu_file in enumerate(cu_files, 1)
         }
         
@@ -263,8 +266,8 @@ Examples:
     
     parser.add_argument('-j', '--parallel', nargs='?', const=True, type=int,
                        help='Enable parallel processing (optionally specify number of workers)')
-    parser.add_argument('--arch', default='80', 
-                       help='Target architecture (50,60,61,70,75,80,all) (default: 80)')
+    parser.add_argument('--arch', default='all', 
+                       help='Target architecture (80,90,100,all) (default: all)')
     parser.add_argument('-v', '--verbose', action='store_true',
                        help='Verbose output')
     parser.add_argument('--dry-run', action='store_true',
@@ -272,21 +275,24 @@ Examples:
     
     args = parser.parse_args()
     
-    # Determine parallelism
+    # Determine parallelism - default to using all CPU cores
     if args.parallel is True:
         max_workers = multiprocessing.cpu_count()
         parallel = True
     elif isinstance(args.parallel, int):
         max_workers = args.parallel
         parallel = True
+    elif args.parallel is None:
+        # Default to parallel processing with all CPU cores
+        max_workers = multiprocessing.cpu_count()
+        parallel = True
     else:
         max_workers = 1
         parallel = False
     
     # Print configuration
-    print("=== CUTLASS PTX Generation Script ===")
+    print("=== CUTLASS PTX Generation Script (Multi-Architecture) ===")
     print(f"Source directory: {INPUT_DIR}")
-    print(f"Output directory: {OUTPUT_DIR}")
     print(f"Target architecture: SM{args.arch}")
     print(f"Parallel mode: {'ENABLED' if parallel else 'DISABLED'}")
     if parallel:
@@ -300,68 +306,74 @@ Examples:
         return 1
     
     # Check if input directory exists
-    if not os.path.exists(INPUT_DIR):
+    if not INPUT_DIR.exists():
         print(f"Error: Input directory not found: {INPUT_DIR}")
         return 1
-        
-    # Create output directory
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
     
     # Determine architectures to process
     if args.arch == 'all':
-        architectures = ['50', '60', '61', '70', '75', '80']
+        architectures = ['80', '90', '100']
     else:
         architectures = [args.arch]
+    
+    # Define output directories for each architecture
+    arch_output_dirs = {
+        '80': BUILD_DIR / 'PTX_sm80',
+        '90': BUILD_DIR / 'PTX_sm90', 
+        '100': BUILD_DIR / 'PTX_sm100'
+    }
     
     total_success = 0
     total_failed = 0
     
     # Process each architecture
     for arch in architectures:
-        arch_dir = os.path.join(INPUT_DIR, arch)
-        if not os.path.exists(arch_dir):
-            print(f"Warning: SM{arch} directory not found at {arch_dir}")
+        if arch not in arch_output_dirs:
+            print(f"Warning: Unsupported architecture SM{arch}")
             continue
             
-        print(f"Found SM{arch} kernels directory")
+        output_dir = arch_output_dirs[arch]
+        output_dir.mkdir(exist_ok=True)
+        
+        print(f"Processing SM{arch} kernels from {INPUT_DIR}")
+        print(f"Output directory: {output_dir}")
         
         if args.dry_run:
-            cu_files = find_cu_files(arch_dir)
-            print(f"Would process {len(cu_files)} .cu files from SM{arch}")
+            cu_files = find_cu_files(str(INPUT_DIR))
+            print(f"Would process {len(cu_files)} .cu files for SM{arch}")
             continue
-        
-        # Update CUDA flags for this architecture if not SM80
-        if arch != '80':
-            global CUDA_FLAGS
-            original_flags = CUDA_FLAGS
-            CUDA_FLAGS = get_cuda_flags_for_arch(arch)
         
         try:
             if parallel:
-                success, failed = process_directory_parallel(arch_dir, arch, max_workers, args.verbose)
+                success, failed = process_directory_parallel(str(INPUT_DIR), arch, output_dir, max_workers, args.verbose)
             else:
-                success, failed = process_directory_serial(arch_dir, arch, args.verbose)
+                success, failed = process_directory_serial(str(INPUT_DIR), arch, output_dir, args.verbose)
                 
             total_success += success
             total_failed += failed
             
-        finally:
-            # Restore original flags
-            if arch != '80':
-                CUDA_FLAGS = original_flags
+        except Exception as e:
+            print(f"Error processing SM{arch}: {e}")
         
         print()
     
     if not args.dry_run:
         print("=== PTX Generation Complete ===")
         print(f"Total: {total_success} successful, {total_failed} failed")
-        print(f"Output files are in: {OUTPUT_DIR}")
+        print("Output directories:")
+        for arch in architectures:
+            if arch in arch_output_dirs:
+                print(f"  SM{arch}: {arch_output_dirs[arch]}")
         print()
         print("To verify generated PTX files:")
-        print(f"  find {OUTPUT_DIR} -name '*.ptx' | wc -l")
+        for arch in architectures:
+            if arch in arch_output_dirs:
+                print(f"  find {arch_output_dirs[arch]} -name '*.ptx' | wc -l")
         print()
         print("To check a specific PTX file:")
-        print(f"  head -20 $(find {OUTPUT_DIR} -name '*.ptx' | head -1)")
+        if architectures and architectures[0] in arch_output_dirs:
+            first_dir = arch_output_dirs[architectures[0]]
+            print(f"  head -20 $(find {first_dir} -name '*.ptx' | head -1)")
     
     return 0
 

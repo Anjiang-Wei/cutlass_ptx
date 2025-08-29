@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
 """
-Script to limit .cu files in a directory to 500 files
-Sorts files by filename and keeps only the first 500, removes the rest
+Script to randomly sample .cu files in a directory to 1000 files
+Randomly selects 1000 files to keep, removes the rest
 """
 
 import os
 import sys
 import argparse
+import random
 from pathlib import Path
 from typing import List
 
@@ -22,27 +23,35 @@ def find_cu_files(directory: Path) -> List[Path]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Limit .cu files in a directory to 500 files",
+        description="Randomly sample .cu files in a directory to 1000 files",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s                                    # Process tools/library/generated/gemm (default)
   %(prog)s /path/to/directory                 # Process specific directory
   %(prog)s --dry-run                         # Show what would be removed without doing it
-  %(prog)s --limit 300                       # Keep only first 300 files instead of 500
+  %(prog)s --limit 800                       # Keep only 800 randomly sampled files instead of 1000
+  %(prog)s --seed 42                         # Use specific random seed for reproducible results
         """
     )
     
     parser.add_argument('directory', nargs='?', 
                        help='Directory to process (default: tools/library/generated/gemm)')
-    parser.add_argument('--limit', type=int, default=500,
-                       help='Maximum number of .cu files to keep (default: 500)')
+    parser.add_argument('--limit', type=int, default=1000,
+                       help='Maximum number of .cu files to keep (default: 1000)')
+    parser.add_argument('--seed', type=int,
+                       help='Random seed for reproducible sampling')
     parser.add_argument('--dry-run', action='store_true',
                        help='Show what would be removed without actually removing files')
     parser.add_argument('-v', '--verbose', action='store_true',
                        help='Verbose output showing all operations')
     
     args = parser.parse_args()
+    
+    # Set random seed if provided
+    if args.seed is not None:
+        random.seed(args.seed)
+        print(f"Using random seed: {args.seed}")
     
     # Determine directory to process
     if args.directory:
@@ -52,9 +61,9 @@ Examples:
         script_dir = Path(__file__).parent.absolute()
         target_dir = script_dir / "tools/library/generated/gemm"
     
-    print(f"=== CU File Limiter ===")
+    print(f"=== CU File Random Sampler ===")
     print(f"Target directory: {target_dir}")
-    print(f"File limit: {args.limit}")
+    print(f"Sample size: {args.limit}")
     print(f"Dry run: {'YES' if args.dry_run else 'NO'}")
     print()
     
@@ -79,14 +88,13 @@ Examples:
         print("No files need to be removed.")
         return 0
     
-    # Sort files by filename (not full path)
-    cu_files.sort(key=lambda x: x.name)
+    # Randomly sample files to keep
+    print(f"Randomly sampling {args.limit} files from {total_files} total files...")
+    files_to_keep = random.sample(cu_files, args.limit)
+    files_to_keep_set = set(files_to_keep)
+    files_to_remove = [f for f in cu_files if f not in files_to_keep_set]
     
-    # Split into keep and remove lists
-    files_to_keep = cu_files[:args.limit]
-    files_to_remove = cu_files[args.limit:]
-    
-    print(f"Will keep first {len(files_to_keep)} files (sorted by filename)")
+    print(f"Will keep {len(files_to_keep)} randomly selected files")
     print(f"Will remove {len(files_to_remove)} files")
     print()
     
